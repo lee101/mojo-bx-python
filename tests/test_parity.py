@@ -125,6 +125,61 @@ def test_bitset_simd_tail_and_unaligned_range():
     assert bits.count_range() == 0
 
 
+def test_bitset_packed_word_and_simd_boundaries():
+    size = 64 * 17 + 13
+    bits = BitSet(size)
+    for start, count in [(1, 62), (63, 2), (65, 511), (577, size - 577)]:
+        bits.set_range(start, count)
+    expected = np.zeros(size, dtype=np.uint8)
+    for start, count in [(1, 62), (63, 2), (65, 511), (577, size - 577)]:
+        expected[start:start + count] = 1
+    assert bits.count_range() == int(expected.sum())
+    assert [bits[i] for i in range(size)] == expected.tolist()
+    bits.clear(64)
+    assert bits.next_clear(63) == 64
+    assert bits.next_set(64) == 65
+
+
+def test_bitset_packed_random_ranges_and_boolean_ops():
+    rng = np.random.default_rng(42)
+    size = 64 * 19 + 7
+    bits = BitSet(size)
+    expected = np.zeros(size, dtype=np.uint8)
+    for _ in range(40):
+        start = int(rng.integers(0, size))
+        count = int(rng.integers(0, size - start + 1))
+        bits.set_range(start, count)
+        expected[start:start + count] = 1
+    for _ in range(20):
+        start = int(rng.integers(0, size))
+        count = int(rng.integers(0, size - start + 1))
+        assert bits.count_range(start, count) == int(expected[start:start + count].sum())
+    other = BitSet(size)
+    other_expected = rng.integers(0, 2, size=size, dtype=np.uint8)
+    for index in np.flatnonzero(other_expected):
+        other.set(int(index))
+    bits.ixor(other)
+    expected ^= other_expected
+    assert [bits[i] for i in range(size)] == expected.tolist()
+
+
+def test_bitset_parallel_range_threshold():
+    size = ((1 << 20) + 4) * 64 + 9
+    bits = BitSet(size)
+    bits.set_range(3, size - 8)
+    assert bits.count_range() == size - 8
+    assert bits.count_range(0, 3) == 0
+    assert bits.count_range(size - 5, 5) == 0
+    bits.set_range(3, size - 8)
+    assert bits.count_range(3, size - 8) == size - 8
+    other = BitSet(size)
+    other.set_range(0, 7)
+    bits.ior(other)
+    assert bits.count_range() == size - 5
+    ~bits
+    assert bits.count_range() == 5
+
+
 def test_alignment_scores_match_published_upstream_vectors():
     pairs = [
         ("CCACTAGTTTTTAAATAATCTACTATCAAATAAAAGATTTGTTAATAATAAATTTTAAATCATTAACACTT", "CCATTTGGGTTCAAAAATTGATCTATCA----------TGGTGGATTATTATTTAGCCATTAAGGACAAAT", -111),

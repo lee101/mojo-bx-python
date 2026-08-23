@@ -19,9 +19,9 @@ ahead of bx-python on `PYTHONPATH`.
 
 Not included are BED/MAF/AXT/LAV readers and writers, interval file indexes,
 clustering, PWM utilities, EPO, site masks, and alignment manipulation tools.
-`BinnedBitSet` intentionally uses a dense byte-per-bit buffer, rather than
-bx-python's sparse bins: its methods and results match, but it does not offer
-the upstream long-run compression advantage.
+`BinnedBitSet` uses the same packed 64-bit-word storage as `BitSet`, rather
+than bx-python's sparse bins: its methods and results match, but it does not
+offer the upstream long-run compression advantage.
 
 ## Install
 
@@ -60,20 +60,22 @@ an isolated interpreter with the same input.
 
 | case | mojo-bx-python | bx-python | result |
 | --- | ---: | ---: | --- |
-| interval find (20k intervals, 2k queries) | 55.4 ms | 8.5 ms | 6.55x slower |
-| alignment scoring (1M columns x 10) | 51.1 ms | 3739.9 ms | 73.18x faster |
-| bitset set/count (10M bits x 20) | 43.8 ms | 19.7 ms | 2.22x slower |
+| interval find (20k intervals, 2k queries) | 22.1 ms | 8.4 ms | 2.64x slower |
+| alignment scoring (1M columns x 10) | 52.5 ms | 3579.3 ms | 68.13x faster |
+| bitset set/count (10M bits x 20) | 7.5 ms | 17.4 ms | 2.33x faster |
 
-The alignment kernel is the intended acceleration target: one native pass over
-the encoded columns eliminates Python's per-character loop. Bitset range,
-count, Boolean, and inversion loops use unaligned-safe CPU SIMD with scalar
-tails. Interval queries use a prefix-maximum index to avoid scanning intervals
-that cannot overlap. They remain slower than bx-python's mature Cython treap,
-and the dense `BinnedBitSet` remains slower than upstream's packed/sparse
-representation.
+The alignment kernel uses one native pass over the encoded columns, eliminating
+Python's per-character loop. Bitsets use packed `uint64` words; range, count,
+Boolean, and inversion loops use CPU SIMD with masked scalar boundaries and
+tails. Mutating bitset operations parallelize only above 8 MiB of packed
+storage. Interval queries combine binary bounds and filtering in one FFI call,
+reuse native output storage, and gather Python objects through a NumPy object
+array. They remain slower than bx-python's mature Cython treap.
 
-No GPU path is included. These kernels are memory-bound or branch/table-lookup
-workloads, so CPU remains the default.
+No GPU path is included. None of the covered kernels exceeds roughly two
+floating-point operations per byte moved: bitsets and interval scans are
+memory/branch bound, while alignment scoring is a branch-heavy table lookup.
+GPU transfer and launch overhead would therefore lose to the CPU path.
 
 Reproduce the table only through the flock-protected task:
 
@@ -87,7 +89,7 @@ Python owns contiguous NumPy buffers. ctypes passes their raw addresses as
 64-bit integers to a single Mojo compilation unit, `src/capi.mojo`; every
 export reconstructs a mutable `UnsafePointer` internally. No Mojo function
 allocates or retains Python memory. Intervals use start-sorted `int64` start
-and end buffers; bit sets use `uint8` values; scoring tables are contiguous
+and end buffers; bit sets use packed `uint64` words; scoring tables are contiguous
 row-major `float64` arrays and alignment text is Latin-1 `uint8`.
 
 ```text

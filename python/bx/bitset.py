@@ -8,6 +8,7 @@ from ._lib import addr, lib
 
 MAX_INT = 2_147_483_647
 MAX = 512 * 1024 * 1024
+_NATIVE = lib()
 
 
 class BitSet:
@@ -17,7 +18,8 @@ class BitSet:
         if bitCount < 0:
             raise ValueError("BitSet size must be non-negative.")
         self.bitCount = int(bitCount)
-        self._bits = np.zeros(self.bitCount, dtype=np.uint8)
+        self._bits = np.zeros((self.bitCount + 63) // 64, dtype=np.uint64)
+        self._bits_addr = addr(self._bits)
 
     @property
     def size(self):
@@ -42,11 +44,11 @@ class BitSet:
 
     def set(self, index):
         self._index(index)
-        self._bits[index] = 1
+        self._bits[index // 64] |= np.uint64(1) << np.uint64(index % 64)
 
     def clear(self, index):
         self._index(index)
-        self._bits[index] = 0
+        self._bits[index // 64] &= ~(np.uint64(1) << np.uint64(index % 64))
 
     def clone(self):
         other = type(self)(self.bitCount)
@@ -55,17 +57,17 @@ class BitSet:
 
     def set_range(self, start, count):
         self._range_count(start, count)
-        lib().mbx_bits_set_range(addr(self._bits), start, count, 1)
+        _NATIVE.mbx_bits_set_range(self._bits_addr, start, count, 1)
 
     def get(self, index):
         self._index(index)
-        return int(self._bits[index])
+        return int((self._bits[index // 64] >> np.uint64(index % 64)) & np.uint64(1))
 
     def count_range(self, start=0, count=None):
         if count is None:
             count = self.bitCount - start
         self._range_count(start, count)
-        return int(lib().mbx_bits_count_range(addr(self._bits), start, count))
+        return int(_NATIVE.mbx_bits_count_range(self._bits_addr, start, count))
 
     def _next(self, start, end, value):
         self._index(start)
@@ -75,7 +77,7 @@ class BitSet:
             raise IndexError(f"Range end ({end}) must be greater than range start({start}).")
         if end > self.bitCount:
             raise IndexError(f"End {end} is larger than the size of this BitSet ({self.bitCount}).")
-        found = int(lib().mbx_bits_next(addr(self._bits), start, end, value))
+        found = int(_NATIVE.mbx_bits_next(self._bits_addr, start, end, value))
         return found
 
     def next_set(self, start, end=None):
@@ -86,18 +88,18 @@ class BitSet:
 
     def iand(self, other):
         self._same_size(other)
-        lib().mbx_bits_binary(addr(self._bits), addr(other._bits), self.bitCount, 0)
+        _NATIVE.mbx_bits_binary(self._bits_addr, other._bits_addr, self.bitCount, 0)
 
     def ior(self, other):
         self._same_size(other)
-        lib().mbx_bits_binary(addr(self._bits), addr(other._bits), self.bitCount, 1)
+        _NATIVE.mbx_bits_binary(self._bits_addr, other._bits_addr, self.bitCount, 1)
 
     def ixor(self, other):
         self._same_size(other)
-        lib().mbx_bits_binary(addr(self._bits), addr(other._bits), self.bitCount, 2)
+        _NATIVE.mbx_bits_binary(self._bits_addr, other._bits_addr, self.bitCount, 2)
 
     def invert(self):
-        lib().mbx_bits_invert(addr(self._bits), self.bitCount)
+        _NATIVE.mbx_bits_invert(self._bits_addr, self.bitCount)
 
     def __getitem__(self, index):
         return self.get(index)

@@ -18,6 +18,7 @@ _SIGNATURES = {
     "mbx_find_indices": ([I, I, I, I, I, I], I),
     "mbx_find_bounds": ([I, I, I, I, I], I),
     "mbx_find_indices_window": ([I, I, I, I, I], I),
+    "mbx_find_indices_bounded": ([I] * 7, I),
     "mbx_overlap_counts": ([I] * 7, None),
     "mbx_bits_set_range": ([I] * 4, None),
     "mbx_bits_count_range": ([I] * 3, I),

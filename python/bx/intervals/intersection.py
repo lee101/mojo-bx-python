@@ -6,6 +6,8 @@ import numpy as np
 
 from bx._lib import addr, i64, lib
 
+_NATIVE = lib()
+
 
 class Interval:
     def __init__(self, start, end, value=None, chrom=None, strand=None):
@@ -95,7 +97,12 @@ class IntervalTree:
             self._starts = i64([x[0] for x in self._items])
             self._ends = i64([x[1] for x in self._items])
             self._max_ends = np.maximum.accumulate(self._ends)
-            self._values = [x[2] for x in self._items]
+            self._values = np.asarray([x[2] for x in self._items], dtype=object)
+            self._indices = np.empty(len(self._items), dtype=np.int64)
+            self._starts_addr = addr(self._starts)
+            self._ends_addr = addr(self._ends)
+            self._max_ends_addr = addr(self._max_ends)
+            self._indices_addr = addr(self._indices)
             self._dirty = False
         return self._starts, self._ends, self._max_ends
 
@@ -108,13 +115,12 @@ class IntervalTree:
     def find(self, start, end):
         if not self._items:
             return []
-        starts, ends, max_ends = self._arrays()
-        packed = int(lib().mbx_find_bounds(addr(starts), addr(max_ends), len(starts), int(start), int(end)))
-        base = len(starts) + 1
-        lo, hi = packed // base, packed % base
-        indices = np.empty(hi - lo, dtype=np.int64)
-        count = lib().mbx_find_indices_window(addr(ends), lo, hi, int(start), addr(indices))
-        return [self._values[i] for i in indices[:count].tolist()]
+        starts, _, _ = self._arrays()
+        count = _NATIVE.mbx_find_indices_bounded(
+            self._starts_addr, self._ends_addr, self._max_ends_addr, len(starts),
+            int(start), int(end), self._indices_addr,
+        )
+        return self._values[self._indices[:count]].tolist()
 
     def before(self, position, num_intervals=1, max_dist=2500):
         candidates = [x for x in self._items if x[1] < position and position - x[1] <= max_dist]
@@ -164,5 +170,5 @@ def overlap_counts(starts, ends, query_starts, query_ends):
     order = np.argsort(starts, kind="stable")
     starts, ends = starts[order], ends[order]
     result = np.empty(len(query_starts), dtype=np.int64)
-    lib().mbx_overlap_counts(addr(starts), addr(ends), len(starts), addr(query_starts), addr(query_ends), len(query_starts), addr(result))
+    _NATIVE.mbx_overlap_counts(addr(starts), addr(ends), len(starts), addr(query_starts), addr(query_ends), len(query_starts), addr(result))
     return result
