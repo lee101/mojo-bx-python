@@ -187,7 +187,11 @@ def test_alignment_scores_match_published_upstream_vectors():
         ("CTTAGTTTTTGATCACC", "-----CTTGGGTTTACC", -299),
     ]
     for left, right, expected in pairs:
-        assert score_texts(hox70, left, right) == expected
+        # mbx_score_texts accumulates in Float64, so compare with a tolerance
+        # rather than demanding a bit-exact float.
+        np.testing.assert_allclose(
+            score_texts(hox70, left, right), expected, rtol=1e-12, atol=1e-12
+        )
     np.testing.assert_allclose(accumulate_scores(hox70, "-----CTTT", "CTTAGTTTA"), [-430, -460, -490, -520, -550, -581, -490, -399, -522])
     np.testing.assert_allclose(accumulate_scores(hox70, "-----CTTT", "CTTAGTTTA", skip_ref_gaps=True), [-581, -490, -399, -522])
 

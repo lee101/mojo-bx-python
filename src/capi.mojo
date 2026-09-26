@@ -4,7 +4,6 @@ The bindings own every buffer.  Addresses are passed as Int because exported
 Mojo functions cannot carry a pointer origin in their public signature.
 """
 
-from max.algorithm import parallelize
 from std.bit import count_trailing_zeros, pop_count
 from std.sys import simd_width_of as simdwidthof
 
@@ -146,14 +145,11 @@ def fill_words_parallel(b: U64Ptr, start: Int, count: Int, value: UInt64):
     var chunk = (count + PARALLEL_TASKS - 1) // PARALLEL_TASKS
     chunk = (chunk + W - 1) // W * W
 
-    @__parameter
-    def work(task: Int):
+    for task in range(PARALLEL_TASKS):
         var offset = task * chunk
         var stop = min(offset + chunk, count)
         if offset < stop:
             fill_words(b, start + offset, stop - offset, value)
-
-    parallelize[work](PARALLEL_TASKS, PARALLEL_TASKS)
 
 
 @export("mbx_bits_set_range")
@@ -238,14 +234,11 @@ def mbx_bits_binary(bits: Int, other: Int, size: Int, operation: Int) abi("C"):
         var chunk = (words + PARALLEL_TASKS - 1) // PARALLEL_TASKS
         chunk = (chunk + W - 1) // W * W
 
-        @__parameter
-        def work(task: Int):
+        for task in range(PARALLEL_TASKS):
             var start = task * chunk
             var stop = min(start + chunk, words)
             if start < stop:
                 bits_binary_words(a, b, start, stop - start, operation)
-
-        parallelize[work](PARALLEL_TASKS, PARALLEL_TASKS)
     else:
         bits_binary_words(a, b, 0, words, operation)
 
@@ -289,14 +282,11 @@ def mbx_bits_invert(bits: Int, size: Int) abi("C"):
         var chunk = (words + PARALLEL_TASKS - 1) // PARALLEL_TASKS
         chunk = (chunk + W - 1) // W * W
 
-        @__parameter
-        def work(task: Int):
+        for task in range(PARALLEL_TASKS):
             var start = task * chunk
             var stop = min(start + chunk, words)
             if start < stop:
                 invert_words(b, start, stop - start)
-
-        parallelize[work](PARALLEL_TASKS, PARALLEL_TASKS)
     else:
         invert_words(b, 0, words)
     if size % 64 != 0:
