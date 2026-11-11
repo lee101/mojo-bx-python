@@ -178,8 +178,7 @@ written out.
 The alignment kernel uses one native pass over the encoded columns, eliminating
 Python's per-character loop. Bitsets use packed `uint64` words; range, count,
 Boolean, and inversion loops use CPU SIMD with masked scalar boundaries and
-tails. Mutating bitset operations parallelize only above 8 MiB of packed
-storage. Interval queries combine binary bounds and filtering in one FFI call:
+tails. Interval queries combine binary bounds and filtering in one FFI call:
 `overlap_counts` binary-searches both ends of the candidate window and counts
 the survivors with a SIMD reduction, and `find_bounded` compacts a SIMD block at
 a time. Queries reuse native output storage and gather Python objects through
@@ -189,6 +188,154 @@ kernel. Scoring tables are only range-checked for 64-bit integer dtypes, since
 narrower integers cannot hold a value above 2**53, which keeps that scan off
 the per-call path. `accumulate_scores` and `score_texts` keep their sequential
 gap carry in the kernel for the reason given above.
+
+### Parallelism
+
+Packed-word bitset loops run on worker threads above a size threshold, using
+`parallelize` from `max.algorithm` (`MOJO_NOTES.md` section 4). The call always
+passes an explicit worker count: the 2-argument form segfaults from a ctypes
+host, which `bench/probe_parallel_host.py` reproduces.
+
+Three mutations thread: `set_range`, the `iand`/`ior`/`ixor` family, and
+`invert`. Each splits its word range into `PARALLEL_TASKS = 4` contiguous
+chunks rounded up to a whole SIMD block, so no lane ever straddles a chunk
+boundary. `count_range` and every interval, alignment and scoring kernel stay
+serial (see the reverted list below).
+
+The threshold is `PARALLEL_WORD_THRESHOLD = 1 << 24` words: 128 Mi-bit, or
+16 MiB of packed storage. It was chosen from measurements, not guessed:
+
+* A threaded `parallelize` launch has a fixed cost on this host of roughly
+  2.8-7.2 ms (median of 200 empty-worker launches: 4.5-5.2 ms for 2-8 workers,
+  spread by shared-host load, and independent of worker count). A serial loop
+  over the same number of units costs about 1-2 us. Well below the threshold
+  the serial loop finishes all its work in less than the launch costs, so
+  threading can only lose there.
+* At caller sizes the crossover measured between 128 and 1024 Mi-bit: at
+  128 Mi-bit threading was 1.00-1.05x, at 1024 Mi-bit `set_range` ranged from
+  parity to 1.24x slower depending on host load, and `iand`/`invert` were
+  1.06-1.40x faster.
+* Only far above the caller range is the win large and stable. At 8192 Mi-bit,
+  repeated verified trials give `iand` 1.54-1.67x and `invert` 1.26-1.39x.
+
+So the threshold sits at a conservative 16 MiB rather than at the measured
+crossover: threading is a real win well above it, host noise swamps it near the
+crossover, and below it the launch would dominate. Sizes between the threshold
+and the crossover (16-128 MiB of packed words) pay a modest loss; that is the
+measured margin above the crossover point rather than a claim that threading
+wins everywhere above the cutoff.
+
+Thread scaling was measured at 1, 2, 4, 6 and 8 workers
+(`bench/thread_scale.py`, `bench/thread_scale_large.py`) on 1 GiB and 4 GiB
+calls:
+
+| size, kernel | 1 | 2 | 4 | 6 | 8 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 GiB `count_range` read | 0.98x | 1.20x | 1.38x | 1.44x | 1.46x |
+| 1 GiB `iand` | 1.03x | 1.45x | 1.67x | 1.53x | 1.80x |
+| 1 GiB `invert` | 1.01x | 1.22x | 1.39x | 1.36x | 1.38x |
+| 4 GiB `set_range` | 1.12x | 1.26x | 1.37x | 1.42x | 1.47x |
+| 4 GiB `count_range` read | 1.03x | 1.27x | 1.44x | 1.53x | 1.55x |
+| 4 GiB `iand` | 0.99x | 1.23x | 1.57x | 1.64x | 1.72x |
+
+Scaling flattens after 4 workers (4 -> 6 adds under 10%, 6 -> 8 is inside the
+noise and occasionally reverses, as `iand` at 1 GiB does). The cap is therefore
+4, which also respects the shared host.
+
+Before and after, with the production API on 1024 and 1536 Mi-bit bitsets (the
+largest `BitSet` the library accepts) and everything else equal. "Before" is the
+git-`HEAD` library and "after" is this one; setup is outside the clock, results
+are asserted identical between builds, and each cell is the median of 5 within
+one batch. Six batches were taken; the ranges below are across batches, because
+this shared host's load moved between 14 and 35 while they ran
+(`bench/parallel_api.py`, `bench/parallel_scale.py`):
+
+| size, op | before | after | result |
+| --- | ---: | ---: | --- |
+| 1024 Mi-bit, `iand` | 71.4-136.6 ms | 52.9-67.5 ms | 1.06-2.58x faster |
+| 1024 Mi-bit, `invert` | 73.8-122.4 ms | 52.8-62.7 ms | 1.20-1.95x faster |
+| 1536 Mi-bit, `iand` | 98.7-187.9 ms | 85.2-168.9 ms | 1.11-1.23x faster |
+| 1536 Mi-bit, `invert` | 95.2-166.9 ms | 82.6-149.2 ms | 1.09-1.24x faster |
+| 1024 Mi-bit, `count_range` | 16.5-41.6 ms | 15.8-35.8 ms | 1.00x (serial in both) |
+| 1536 Mi-bit, `count_range` | 24.0-61.0 ms | 24.4-44.6 ms | 1.00x (serial in both) |
+| 1024 Mi-bit, `set_range` | 9.7-37.3 ms | 16.7-30.0 ms | 1.72-1.96x slower (forced) |
+| 1536 Mi-bit, `set_range` | 14.4-60.8 ms | 16.2-31.6 ms | 1.17x slower to 1.80x faster |
+
+The single widest cell (`iand`, 1.06-2.58x) is reported as measured, but the
+tight repeatable range is the narrower one in the kernel-only runs; treat the
+outer edges as host noise, not as a scalable figure.
+
+`set_range` fill behaviour, stated plainly because the numbers disagree across
+batches. Measured on the final build with fresh 4 MiB `BitSet` allocations per
+repetition (median of 15, serial build vs forced-threaded build):
+
+| size | serial | threaded | outcome |
+| ---: | ---: | ---: | --- |
+| 1024 Mi-bit | 10.6 ms | 12.1 ms | 1.14x slower |
+| 1536 Mi-bit | 15.4 ms | 15.9 ms | 1.03x slower |
+| 8192 Mi-bit | 49.7 ms | 52.1 ms | 1.05x slower |
+| 20480 Mi-bit | 89.2 ms | 91.5 ms | 1.03x slower |
+
+Earlier batches on the same mutation ranged from roughly parity to 1.4x
+faster (at 1536 Mi-bit) and to 1.5-1.9x slower, so the sign of this effect is
+not stable on this host: the host's load moved between 14 and 35 during these
+measurements. The defensible reading is that threading the fill is never a
+clear, repeatable win at any size that was measured, and the win for the same
+mutation reported at 20+ GiB in one earlier run did not reproduce against the
+final build. Because the fill shares the threshold with `iand`/`invert`, a
+caller above 1536 Mi-bit may pay up to about 1.1x on the fill for the
+1.06-1.40x measured on `iand` and 1.09-1.31x on `invert` at caller sizes (the
+large-size thread-scaling runs give 1.7x and 1.4x). The fill is not reverted
+to serial because, with a shared cutoff, the three operations still come out
+ahead together, but it is the weakest of the three and should be re-measured if
+this host becomes quieter. The shipped build keeps the serial fill at
+1024 Mi-bit (16 MiB is under the 1 GiB threshold line), so the exposure starts
+above 1536 Mi-bit.
+
+Also kept, below the threshold: `set_range` fills the word range with 256-bit
+stores (4 x 32 B per 64 B line). It wins 5-40% on fresh storage at 0.4-2.8 ms
+and measures parity at 30 ms.
+
+Not hidden either: the alignment and interval kernels were re-probed for
+parallelism and left serial. Their per-query and per-column work carries state
+(gap open/extend across the preceding column) that a chunk boundary would
+change the result for; splitting them needs bookkeeping that costs more than the
+credit earned, which is the same conclusion the SIMD pass reached above. The
+bitset count read threads well on its own (3.5-3.7x on 4 workers at 4 GiB), but
+`count_range` is left serial: the variants that keep each worker's data in cache
+while counting it lost at the sizes a caller reaches, their scratch buffers
+polluted other buffers' locality, and the reduction into a shared partial
+buffer has no measurable gain.
+
+Reverted, each measured before being dropped:
+
+| candidate | measured | outcome |
+| --- | --- | --- |
+| interleave blocks across the calling thread (`parallelize(f, parts, 1)`) | 0.95-1.25x, worse than one launch | reverted |
+| threaded `count_range` with a two-stage grid, 16/64 MiB chunks | 1.00-1.05x on the read, 1.08x at 1024 Mi-bit, 1.01x at 1536 Mi-bit | reverted |
+| threaded counting via cache-sized prefetch + per-worker scratch | 0.33x, prefetch evicted the loop's own data | reverted |
+| threaded fill with the 256-bit serial body, at 1024-1536 Mi-bit | 1.5x slower than serial | reverted |
+| `binary_words_wide` 256-bit body for `iand`/`ior`/`ixor` | 1.05x slower at 128 Mi-bit | reverted |
+| `set_range`/`count_range` threading at 1024-1536 Mi-bit | 2.79x/5.36x slower in the API batch once setup was excluded | not reverted, see below |
+
+`count_range` is reverted outright: threading it never beat serial by more
+than 8%, and its reduction also needs a scratch buffer. The threaded fill is not
+reverted: on repeated trials it paid at 1024-1536 Mi-bit (see the before/after
+table; a different host-load window shows parity), and it stays under the one
+shared threshold for the `iand`/`invert` wins, with its loss reported there.
+Every candidate above was measured alternating with the baseline on the same
+buffer in one process.
+
+Equivalence is tested, not assumed: `tests/test_parallel_paths.py` builds
+`src/capi.mojo` twice (shipped threshold, and threshold forced to 0 so every
+mutation threads even at test-sized inputs) and compares 16, 192 and
+1536 Mi-bit results bit-for-bit, including unaligned first words, partial last
+words, tail-bit masking after `invert`, and the same operations through the
+public `BitSet` API against a swapped native library. The module-level
+equivalence harness (`bench/parallel_equivalence.py`) additionally checks 32-64
+Mi-word sizes and all three boolean operations. Because the branch is decided
+by size alone, a threaded run at 1536 Mi-bit exercises exactly the code a
+threaded run at 8192 Mi-bit would.
 
 No GPU path is included. None of the covered kernels exceeds roughly two
 floating-point operations per byte moved: bitsets and interval scans are

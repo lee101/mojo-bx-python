@@ -6,13 +6,21 @@ Mojo functions cannot carry a pointer origin in their public signature.
 
 from std.bit import count_trailing_zeros, pop_count
 from std.sys import simd_width_of as simdwidthof
+from max.algorithm import parallelize
 
 comptime U8Ptr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
 comptime U64Ptr = UnsafePointer[UInt64, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int, AnyOrigin[mut=True]]
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime W = simdwidthof[DType.float64]()
-comptime PARALLEL_WORD_THRESHOLD = 1 << 20
+# Packed-word loops run on worker threads only above this many words (2**24
+# words = 128 Mi-bit = 16 MiB of packed storage).  Measured crossover and the
+# margin above it are in README "Parallelism".  Below it the serial loop wins:
+# a threaded launch costs ~2-7 ms of fixed wait/spawn/rejoin on this host, and
+# the serial loop touches 16 MiB in well under 1 ms, so a smaller cutoff only
+# ever pays the launch.
+comptime PARALLEL_WORD_THRESHOLD = 1 << 24
+# The host is shared; 4 workers is the cap.  Measured scaling flattens past it.
 comptime PARALLEL_TASKS = 4
 
 
@@ -176,24 +184,29 @@ def low_mask(bits: Int) -> UInt64:
     return (UInt64(1) << UInt64(bits)) - UInt64(1)
 
 
-def fill_words(b: U64Ptr, start: Int, count: Int, value: UInt64):
-    var vector_end = count - count % W
+def words_chunk(count: Int, parts: Int) -> Int:
+    """Words per unit, rounded up to a whole SIMD block so lanes never straddle."""
+    var chunk = (count + parts - 1) // parts
+    return (chunk + W - 1) // W * W
+
+
+def fill_words_hw(b: U64Ptr, start: Int, count: Int, value: UInt64):
+    """Fill with 256-bit stores: 4 W-wide stores per 64-byte cache line."""
+    comptime H = 4
     var values = SIMD[DType.uint64, W](value)
-    for i in range(0, vector_end, W):
+    var i = 0
+    while i + H * W <= count:
+        var j = 0
+        while j < H:
+            b.store(start + i + j * W, values)
+            j += 1
+        i += H * W
+    while i + W <= count:
         b.store(start + i, values)
-    for i in range(vector_end, count):
-        b[start + i] = value
-
-
-def fill_words_parallel(b: U64Ptr, start: Int, count: Int, value: UInt64):
-    var chunk = (count + PARALLEL_TASKS - 1) // PARALLEL_TASKS
-    chunk = (chunk + W - 1) // W * W
-
-    for task in range(PARALLEL_TASKS):
-        var offset = task * chunk
-        var stop = min(offset + chunk, count)
-        if offset < stop:
-            fill_words(b, start + offset, stop - offset, value)
+        i += W
+    while i < count:
+        b.unsafe_store(start + i, value)
+        i += 1
 
 
 @export("mbx_bits_set_range")
@@ -223,14 +236,40 @@ def mbx_bits_set_range(bits: Int, start: Int, count: Int, value: Int) abi("C"):
     var middle_start = first + 1
     var middle_count = last - middle_start
     var fill = ~UInt64(0) if value != 0 else UInt64(0)
+    # One wide body for both paths: the 256-bit fill wins below the threshold
+    # and inside a worker, so there is no shape that beats it at these sizes.
     if middle_count >= PARALLEL_WORD_THRESHOLD:
-        fill_words_parallel(b, middle_start, middle_count, fill)
+        var chunk = words_chunk(middle_count, PARALLEL_TASKS)
+        def work(task: Int) {imm}:
+            var offset = task * chunk
+            var stop = min(offset + chunk, middle_count)
+            if offset < stop:
+                fill_words_hw(b.unsafe_offset(middle_start + offset), 0, stop - offset, fill)
+        parallelize(work, PARALLEL_TASKS, PARALLEL_TASKS)
     else:
-        fill_words(b, middle_start, middle_count, fill)
+        fill_words_hw(b, middle_start, middle_count, fill)
+
+
+def count_words(b: U64Ptr, start: Int, count: Int) -> Int:
+    var total = 0
+    var vector_end = count - count % W
+    for i in range(0, vector_end, W):
+        total += Int(pop_count(b.unsafe_load[width=W](start + i)).reduce_add())
+    for i in range(vector_end, count):
+        total += Int(pop_count(b[start + i]))
+    return total
 
 
 @export("mbx_bits_count_range")
 def mbx_bits_count_range(bits: Int, start: Int, count: Int) abi("C") -> Int:
+    """Count set bits in [start, start+count).
+
+    Deliberately serial at every size.  The counting read itself threads well
+    (3.5-3.7x on 4 workers at 4 GiB), but the variants that keep each worker's
+    data in cache while counting it all lost at the sizes a caller reaches
+    (README "Parallelism"), and a threaded scan costs ~6 ms of launch, which the
+    caller-visible range cannot absorb.
+    """
     if count == 0:
         return 0
     var b = u64(bits)
@@ -245,11 +284,7 @@ def mbx_bits_count_range(bits: Int, start: Int, count: Int) abi("C") -> Int:
     total += Int(pop_count(b[last] & low_mask(end_offset if end_offset != 0 else 64)))
     var middle_start = first + 1
     var middle_count = last - middle_start
-    var vector_end = middle_count - middle_count % W
-    for i in range(0, vector_end, W):
-        total += Int(pop_count(b.unsafe_load[width=W](middle_start + i)).reduce_add())
-    for i in range(vector_end, middle_count):
-        total += Int(pop_count(b[middle_start + i]))
+    total += count_words(b, middle_start, middle_count)
     return total
 
 
@@ -275,14 +310,13 @@ def mbx_bits_binary(bits: Int, other: Int, size: Int, operation: Int) abi("C"):
     var b = u64(other)
     var words = (size + 63) // 64
     if words >= PARALLEL_WORD_THRESHOLD:
-        var chunk = (words + PARALLEL_TASKS - 1) // PARALLEL_TASKS
-        chunk = (chunk + W - 1) // W * W
-
-        for task in range(PARALLEL_TASKS):
-            var start = task * chunk
-            var stop = min(start + chunk, words)
-            if start < stop:
-                bits_binary_words(a, b, start, stop - start, operation)
+        var chunk = words_chunk(words, PARALLEL_TASKS)
+        def work(task: Int) {imm}:
+            var offset = task * chunk
+            var stop = min(offset + chunk, words)
+            if offset < stop:
+                bits_binary_words(a.unsafe_offset(offset), b.unsafe_offset(offset), 0, stop - offset, operation)
+        parallelize(work, PARALLEL_TASKS, PARALLEL_TASKS)
     else:
         bits_binary_words(a, b, 0, words, operation)
 
@@ -323,16 +357,16 @@ def mbx_bits_invert(bits: Int, size: Int) abi("C"):
     var b = u64(bits)
     var words = (size + 63) // 64
     if words >= PARALLEL_WORD_THRESHOLD:
-        var chunk = (words + PARALLEL_TASKS - 1) // PARALLEL_TASKS
-        chunk = (chunk + W - 1) // W * W
-
-        for task in range(PARALLEL_TASKS):
-            var start = task * chunk
-            var stop = min(start + chunk, words)
-            if start < stop:
-                invert_words(b, start, stop - start)
+        var chunk = words_chunk(words, PARALLEL_TASKS)
+        def work(task: Int) {imm}:
+            var offset = task * chunk
+            var stop = min(offset + chunk, words)
+            if offset < stop:
+                invert_words(b.unsafe_offset(offset), 0, stop - offset)
+        parallelize(work, PARALLEL_TASKS, PARALLEL_TASKS)
     else:
         invert_words(b, 0, words)
+    # After the whole parallel region: no worker may touch this word unseen.
     if size % 64 != 0:
         b[words - 1] &= low_mask(size % 64)
 
