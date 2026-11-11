@@ -203,7 +203,7 @@ def mbx_bits_count_range(bits: Int, start: Int, count: Int) abi("C") -> Int:
     var middle_count = last - middle_start
     var vector_end = middle_count - middle_count % W
     for i in range(0, vector_end, W):
-        total += Int(pop_count(b.load[width=W](middle_start + i)).reduce_add())
+        total += Int(pop_count(b.unsafe_load[width=W](middle_start + i)).reduce_add())
     for i in range(vector_end, middle_count):
         total += Int(pop_count(b[middle_start + i]))
     return total
@@ -247,8 +247,8 @@ def bits_binary_words(a: U64Ptr, b: U64Ptr, start: Int, count: Int, operation: I
     var vector_end = count - count % W
     for i in range(0, vector_end, W):
         var offset = start + i
-        var left = a.load[width=W](offset)
-        var right = b.load[width=W](offset)
+        var left = a.unsafe_load[width=W](offset)
+        var right = b.unsafe_load[width=W](offset)
         if operation == 0:
             a.store(offset, left & right)
         elif operation == 1:
@@ -269,7 +269,7 @@ def invert_words(b: U64Ptr, start: Int, count: Int):
     var vector_end = count - count % W
     for i in range(0, vector_end, W):
         var offset = start + i
-        b.store(offset, ~b.load[width=W](offset))
+        b.store(offset, ~b.unsafe_load[width=W](offset))
     for i in range(vector_end, count):
         b[start + i] = ~b[start + i]
 
