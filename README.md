@@ -337,10 +337,86 @@ Mi-word sizes and all three boolean operations. Because the branch is decided
 by size alone, a threaded run at 1536 Mi-bit exercises exactly the code a
 threaded run at 8192 Mi-bit would.
 
-No GPU path is included. None of the covered kernels exceeds roughly two
-floating-point operations per byte moved: bitsets and interval scans are
-memory/branch bound, while alignment scoring is a branch-heavy table lookup.
-GPU transfer and launch overhead would therefore lose to the CPU path.
+## GPU
+
+CPU only: memory-bound. No GPU path is shipped, and none is planned for this
+subset.
+
+The GPU gate for this phase was run rather than assumed. Two things are on
+record. First, `bench/analysis.md` does not exist in this repository (it is not
+in any commit either), so the kernel list was rebuilt from the code itself:
+eleven exports in `src/capi.mojo`, measuring flops against bytes read *and*
+written per element. Second, the shared device was free enough to use:
+
+```
+$ nvidia-smi --query-gpu=memory.free --format=csv,noheader
+5190 MiB            # RTX 5090, above the 4000 MiB floor
+$ pixi run mojo run bench/probe_gpu.mojo
+device: NVIDIA GeForce RTX 5090
+```
+
+So the phase was not skipped for a missing device; it was rejected on the
+arithmetic-intensity gate. Per-element arithmetic intensity of every covered
+kernel:
+
+| kernel | work per element | bytes per element | intensity | gate |
+| --- | --- | ---: | ---: | --- |
+| `bits_set_range`, `bits_binary`, `bits_invert` | 1 bitwise op per 8-bit word | 16 (read+write) | ~0.06 op/B | memory-bound |
+| `bits_count_range` | 1 popcount per word | 8 | ~0.25 op/B | memory-bound |
+| `find_indices*`, `overlap_counts` | 1-2 integer compares | 8-16 | ~0.1-0.25 op/B | memory/branch-bound |
+| `score_texts`, `accumulate_scores` | 1 table load + ~4 compares + 1 FP add | 2 streamed (table in L1) | ~3 op/B but a serial carry | not splittable |
+
+Only `score_texts`/`accumulate_scores` clear two operations per byte, and only
+if integer compares are counted as operations. They are also the one kernel
+that cannot use a GPU meaningfully: `gap_open`/`gap_extend` depend on the class
+of the immediately preceding column, so the kernel is a strictly sequential
+state machine. A GPU would run it as a single thread over every column — the
+"one kernel launch" rule cannot help when there is only one thread's worth of
+parallel work. This is the same wall the SIMD pass and the unroll pass hit
+(see "Reverted" above), now for the third time.
+
+Measured, not estimated (`bench/probe_intensity.py`, `bench/probe_gpu_floor.py`;
+best of 9 calls per case, two runs on the shared host):
+
+| case | CPU | GPU floor (copy up + copy back + sync, no kernel) | result |
+| --- | ---: | ---: | --- |
+| `score_texts` raw, 1 M cols (2 MB) | 2.1-2.3 ms | 0.54 + 1.15 ms | copy alone ~0.7x the whole call; a kernel only adds |
+| `score_texts` raw, 100 M cols (200 MB) | 217-219 ms | 31 + 51-61 ms = 82-92 ms | GPU floor is ~2.4-2.7x under CPU, but the kernel is one serial thread, so the launch cannot help |
+| bitset `set_range`, 10 M bits (1.25 MB) | 0.055 ms | > 1.7 ms at 1 MB | GPU loses by >30x before any kernel |
+| bitset `count_range`, 10 M bits | 0.105-0.204 ms | > 1.7 ms at 1 MB | GPU loses by >8x before any kernel |
+| bitset `iand`, 10 M bits | 0.109-0.205 ms | > 1.7 ms at 1 MB | GPU loses by >8x before any kernel |
+| `overlap_counts` raw, 20k intervals x 2k queries | 0.51-0.73 ms | 1 MB round trip is already > 1.7 ms | GPU loses; the CPU path is bounds + SIMD over ~35 candidates per query |
+
+The 1 MB floor row is the smallest transfer measured (0.54 ms up, 1.15-1.31 ms back);
+the 200 MB and 1 GiB rows scale roughly linearly (200 MB: 31 ms up, 51-61 ms
+back; 1 GiB: 198-203 ms up, 389-419 ms back, i.e. about 5.5 GB/s round trip on
+this shared device). The bitset cases
+move 1.25 MB of packed words and would pay a full round trip for a kernel that
+already runs at 23-45 GB/s on the CPU. The only case where the raw copy is
+cheaper than the CPU call is the 100 M-column alignment, and there the work is
+one strictly dependent chain of columns: `gap_open`/`gap_extend` for column *i*
+depends on the gap state of column *i-1*, so the maximum parallelism is one
+thread. One GPU thread over 100 M columns cannot beat a CPU core doing 2.2 ns
+per column, and the CPU number already includes the whole call.
+
+Nothing was built and reverted: no candidate passed the flops/byte gate, so no
+kernel was written and no A/B table of GPU variants exists to report. The CPU
+kernels are unchanged by this phase. The device-allocation limit (2 GiB) was
+never approached: the largest buffer the probes allocated was 1 GiB, and the
+smallest free-memory reading taken before a run was 5190 MiB.
+
+`tests/test_gpu_paths.py` is not created because there is no GPU path to test.
+If one is added later, its test must skip with `pytest.mark.skipif` on a failed
+`DeviceContext()` and the README must record the skip. The probes that produced
+the numbers above are kept so the decision can be re-checked on a quieter host
+or a newer toolchain:
+
+```bash
+pixi run python bench/probe_intensity.py      # CPU kernel throughput
+pixi run python bench/probe_gpu_floor.py      # CPU kernel time + GPU copy floor
+pixi run mojo run bench/probe_gpu.mojo        # device present?
+pixi run mojo run bench/probe_gpu_floor.mojo  # GPU copy floor at several sizes
+```
 
 Reproduce the table only through the flock-protected task:
 
