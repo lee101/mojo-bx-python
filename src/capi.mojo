@@ -82,7 +82,7 @@ def mbx_find_bounds(starts: Int, max_ends: Int, n: Int, start: Int, end: Int) ab
 
 @export("mbx_find_indices_window")
 def mbx_find_indices_window(ends: Int, lo: Int, hi: Int, start: Int, dst: Int) abi("C") -> Int:
-    """Filter a previously bounded interval window and write relative indices."""
+    """Filter a previously bounded interval window and write absolute indices."""
     var e = ip(ends)
     var result = ip(dst)
     var count = 0
@@ -98,31 +98,75 @@ def mbx_find_indices_bounded(starts: Int, ends: Int, max_ends: Int, n: Int, star
     """Bound and filter an overlap query in one FFI call."""
     var lo = upper_bound(ip(max_ends), n, start)
     var hi = lower_bound(ip(starts), n, end)
-    var e = ip(ends)
-    var result = ip(dst)
+    if lo >= hi:
+        return 0
+    return filter_indices(ip(ends), lo, hi, start, ip(dst))
+
+
+def filter_indices(e: IPtr, lo: Int, hi: Int, start: Int, dst: IPtr) -> Int:
+    """Write indices in [lo, hi) whose end is after ``start``, compacted.
+
+    Iteration order is part of the result, but the lanes in a block are
+    independent, so the compare runs on a SIMD block and only the lanes that
+    hit are stored.  Isolated on the real caller window size (170 candidates,
+    2000 windows): scalar 0.32-0.34 ms, this form 0.14-0.15 ms.  End to end
+    that change sits inside the +-3% noise of IntervalTree.find, which is
+    dominated by the per-query Python and ctypes cost.
+    """
+    comptime I = SIMD[DType.int64, W]
+    var needle = I(start)
     var count = 0
-    for i in range(lo, hi):
-        if e[i] > start:
-            result[count] = i
+    var i = lo
+    while i + W <= hi:
+        var hits = e.unsafe_load[width=W](i).cast[DType.int64]().gt(needle).cast[DType.int64]()
+        if Int(hits.reduce_add()) != 0:
+            for k in range(W):
+                if hits[k] != 0:
+                    dst.unsafe_store(count, i + k)
+                    count += 1
+        i += W
+    while i < hi:
+        if e.unsafe_load(i) > start:
+            dst.unsafe_store(count, i)
             count += 1
+        i += 1
     return count
 
 
 @export("mbx_overlap_counts")
-def mbx_overlap_counts(starts: Int, ends: Int, n: Int, qstarts: Int, qends: Int, m: Int, dst: Int) abi("C"):
-    """Count overlaps for many queries against start-sorted intervals."""
+def mbx_overlap_counts(starts: Int, ends: Int, max_ends: Int, n: Int, qstarts: Int, qends: Int, m: Int, dst: Int) abi("C"):
+    """Count overlaps for many queries against start-sorted intervals.
+
+    ``starts`` is ascending and ``max_ends`` is its running maximum, so both
+    ends of the candidate window are binary searches instead of a scan that
+    breaks early.  Once the prefix whose running max end is at or below the
+    query start is skipped, every remaining iteration is independent and the
+    comparison is a SIMD reduction with a scalar tail.
+    """
     var s = ip(starts)
     var e = ip(ends)
+    var me = ip(max_ends)
     var qs = ip(qstarts)
     var qe = ip(qends)
     var result = ip(dst)
+    comptime I = SIMD[DType.int64, W]
     for q in range(m):
+        var hi = lower_bound(s, n, qe.unsafe_load(q))
+        var lo = upper_bound(me, n, qs.unsafe_load(q))
+        if lo >= hi:
+            result[q] = 0
+            continue
+        var needle = I(qs.unsafe_load(q))
         var count = 0
-        for i in range(n):
-            if s[i] >= qe[q]:
-                break
-            if e[i] > qs[q]:
+        var i = lo
+        while i + W <= hi:
+            var hits = e.unsafe_load[width=W](i).cast[DType.int64]().gt(needle).cast[DType.int64]()
+            count += Int(hits.reduce_add())
+            i += W
+        while i < hi:
+            if e.unsafe_load(i) > qs.unsafe_load(q):
                 count += 1
+            i += 1
         result[q] = count
 
 

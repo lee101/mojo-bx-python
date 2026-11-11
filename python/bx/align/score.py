@@ -111,8 +111,12 @@ def _native_table(scoring_scheme):
     table = np.asarray(scoring_scheme.table)
     if table.ndim != 2 or table.dtype.kind not in "biuf":
         return None
-    if table.dtype.kind in "iu" and np.any(np.abs(table.astype(object)) > 2**53):
-        return None
+    # Only 64-bit integers can hold values above 2**53; the object-dtype check
+    # that proves it is what made this scan expensive on every call.  Narrower
+    # integers are representable exactly by construction, so skip the scan.
+    if table.dtype.kind in "iu" and table.dtype.itemsize > 4:
+        if np.any(np.abs(table.astype(object)) > 2**53):
+            return None
     native = np.ascontiguousarray(table, dtype=np.float64)
     # Do not silently turn large integers or extended-precision values into a
     # different scoring matrix at the ABI boundary.

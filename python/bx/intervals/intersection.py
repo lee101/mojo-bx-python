@@ -169,6 +169,10 @@ def overlap_counts(starts, ends, query_starts, query_ends):
         raise ValueError("start and end arrays must have matching lengths")
     order = np.argsort(starts, kind="stable")
     starts, ends = starts[order], ends[order]
+    # The kernel binary-searches the running maximum end, so it is built here
+    # rather than inside the per-query loop.
+    max_ends = np.maximum.accumulate(ends) if len(ends) else ends
     result = np.empty(len(query_starts), dtype=np.int64)
-    _NATIVE.mbx_overlap_counts(addr(starts), addr(ends), len(starts), addr(query_starts), addr(query_ends), len(query_starts), addr(result))
+    _NATIVE.mbx_overlap_counts(addr(starts), addr(ends), addr(max_ends), len(starts),
+                               addr(query_starts), addr(query_ends), len(query_starts), addr(result))
     return result
