@@ -19,6 +19,14 @@ toolchain bump rather than trusting this file.
 
 ## 1. Language changes from the 0.x/1.0 dialect
 
+- **`@parameter for` does not exist on 1.2.0.** Decorating a `for` is a compile
+  error: `'for' statement does not support decorators; remove the decorator`.
+  A `for` over a `comptime` bound (`comptime K = 4` then `for k in range(K)`)
+  does compile, but the loop index is not folded at comptime: `if lane == 0`
+  on it stays a runtime branch. A `comptime K` is usable as a `SIMD` length
+  (`SIMD[DType.int64, K]()`). For a guaranteed fixed-trip-count unroll, write
+  the statements out.
+
 - **`fn` has been removed. Use `def` for everything.** `fn` is a hard error:
   `'fn' has been removed; use 'def' instead`.
 - `UnsafePointer` is deprecated in favour of **`Pointer`**. It still compiles, with

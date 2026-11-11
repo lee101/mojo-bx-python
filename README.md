@@ -54,15 +54,50 @@ PY
 ## Performance
 
 Measured with `pixi run bench` on `leaf-gpu-dedicated-server`, Linux
-6.8.0-136-generic x86_64 (glibc 2.39), Python 3.13.14. Times include the
-public Python API but exclude process startup; each case runs both packages in
-an isolated interpreter with the same input.
+6.8.0-136-generic x86_64 (glibc 2.39) then 6.8.0-147-generic, Python 3.13.14.
+Times include the public Python API but exclude process startup; each case runs
+both packages in an isolated interpreter with the same input.
 
 | case | mojo-bx-python | bx-python | result |
 | --- | ---: | ---: | --- |
-| interval find (20k intervals, 2k queries) | 22.1 ms | 8.4 ms | 2.64x slower |
+| interval find (20k intervals, 2k queries) | 27.8 ms | 8.4 ms | 2.64x slower |
 | alignment scoring (1M columns x 10) | 52.5 ms | 3579.3 ms | 68.13x faster |
 | bitset set/count (10M bits x 20) | 7.5 ms | 17.4 ms | 2.33x faster |
+| ^ re-measured before this pass | 27.8 / 46.8-52.5 / 7.5-8.5 ms | - | - |
+| ^ re-measured after this pass | 21.3-23.8 / 33.5-46.8 / 6.8-8.5 ms | - | no kernel change |
+
+The last two rows are the same unchanged kernels measured before and after the
+unroll pass, three `pixi run bench` invocations each. The spread is the
+shared host's, not the code's, and no row moved outside it, so no kernel change
+from this pass was kept. All candidates were built, tested and A/B measured
+against a saved baseline library first:
+
+| candidate | isolated effect | caller effect | kept |
+| --- | --- | --- | --- |
+| `mbx_score_texts`, 4 unrolled lanes, independent match sums | ~1.4 ms -> ~0.79 ms per 1M columns | slower once gap state restored | no |
+| `mbx_score_texts`, 4 chunked passes with cross-chunk gap carry | within noise | 2 parity vectors failed, then slower and still inexact | no |
+| `mbx_bits_count_range`, 4 partial popcount counters | ~104 -> ~78 us per 10M bits | inside noise | no |
+| `mbx_bits_count_range`, 8 / 16 / 24 / 32 chains | 73 / 63 / 150 / - us | inside noise, or slower | no |
+
+The isolated numbers are quartile minima over 200 repeated calls; the caller
+case is `pixi run bench`'s own bitset case, which includes the allocation and
+`set_range` around the count. That case is bounded by touching 1.25 MB of
+packed words: at ~46 GB/s here, the count alone can never account for its
+10 ms, so shaving the kernel does not move it.
+
+Two facts make further chain-splitting unattractive here. First, a gap's
+`gap_open`/`gap_extend` depends on the immediately preceding column, whether
+that column is a two-sided gap, and which side the gap is on, so no column's
+penalty can be deferred to a combine step without changing the result; every
+exact split pays for the bookkeeping and every cheap split changes results.
+Second, the scoring sum is over integer table entries, so a multi-accumulator
+split would only matter if a single `Float64` accumulator lost precision, which
+it does not at these magnitudes. If a variant that splits the sum is adopted
+later, results can differ in the last bits; the parity tolerance must then
+stay as it is, and the README must say so. `@parameter for` is not available on
+this pinned compiler (`MOJO_NOTES.md` section 1), so fixed trip counts were
+written out.
+
 
 The alignment kernel uses one native pass over the encoded columns, eliminating
 Python's per-character loop. Bitsets use packed `uint64` words; range, count,
